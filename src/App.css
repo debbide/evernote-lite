@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    @apply bg-[#0D0D0D] text-gray-200 overflow-hidden m-0 p-0;
+  }
+}
+
+.monaco-editor .code-block-bg {
+  background-color: rgba(255, 255, 255, 0.03) !important;
+  border-left: 2px solid rgba(255, 255, 255, 0.1);
+}
+
+/* 彻底隐藏原本的 ``` 字符，替换为优雅的微弱分隔线 */
+.monaco-editor .code-block-boundary-text {
+  font-size: 0 !important;
+  color: transparent !important;
+  letter-spacing: -10px !important;
+}
+.monaco-editor .code-block-boundary-text::after {
+  content: "┈";
+  font-size: 12px !important;
+  color: rgba(255, 255, 255, 0.1) !important;
+  letter-spacing: normal !important;
+}
