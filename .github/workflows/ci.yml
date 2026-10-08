@@ -1,21 +1,23 @@
 name: CI
 
-# 创建 GitHub Release 需要写权限（否则报 Resource not accessible by integration）
+# 创建 GitHub Release 需要写权限
 permissions:
   contents: write
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: '发版 tag（例如 v0.1.0），留空则只编译不发版'
+        required: false
+        default: ''
 
 jobs:
   check:
     name: Check (lint + types)
-    # tag 发版构建跳过重复检查：tag 指向的 commit 在 main 上已经验过
-    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,8 +54,6 @@ jobs:
   build:
     name: Build (Windows)
     needs: check
-    # check 被跳过（tag 构建）时也照常编译；check 失败则不编译
-    if: always() && (needs.check.result == 'success' || needs.check.result == 'skipped')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +73,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # tauri-action 不会自动识别 tag 触发，必须显式传 tagName 才会创建 Release
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: 'evernote-lite ${{ github.ref_name }}'
+          # 只有手动 Run workflow 并填了 tag 才发版；push 只编译不发版
+          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
+          releaseName: 'evernote-lite ${{ inputs.tag }}'
           releaseBody: 'See the assets to download and install this version.'
