@@ -74,12 +74,15 @@ jobs:
           tagName: ${{ inputs.tag }}
           releaseName: 'evernote-lite ${{ inputs.tag }}'
           releaseBody: 'See the assets to download and install this version.'
+          # 同时把裸 exe 传到 Release（便携版，放到 data 文件夹旁边直接用）
+          uploadPlainBinary: true
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
           name: evernote-lite-windows
           path: |
+            src-tauri/target/release/evernote-lite.exe
             src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*-setup.exe
           retention-days: 90
