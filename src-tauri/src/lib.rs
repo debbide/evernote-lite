@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Mutex;
 use tauri::State;
@@ -173,12 +173,12 @@ fn get_launch_file() -> Result<Option<(String, String)>, String> {
 const KEYRING_SERVICE: &str = "evernote-lite";
 const KEYRING_USER: &str = "s3-secret-key";
 
-fn s3_config_path(app_dir: &PathBuf) -> PathBuf {
+fn s3_config_path(app_dir: &Path) -> PathBuf {
     app_dir.join("s3_config.json")
 }
 
 /// 读完整 S3 配置（含 secret）。自动把旧版明文 secret_key 迁移进钥匙串。
-fn load_s3_config(app_dir: &PathBuf) -> Result<S3Config, String> {
+fn load_s3_config(app_dir: &Path) -> Result<S3Config, String> {
     let path = s3_config_path(app_dir);
     let mut cfg: S3Config = if path.exists() {
         let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -493,7 +493,7 @@ async fn backup_to_s3(state: State<'_, AppState>, trigger: Option<String>) -> Re
     let response = s3_request(&config, "PUT", &key, &db_bytes).await?;
     let status = response.status().as_u16();
 
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         let body = response.text().await.unwrap_or_default();
         return Err(format!("备份失败，HTTP {} - {}", status, body));
     }
@@ -530,7 +530,7 @@ async fn restore_from_s3(state: State<'_, AppState>, key: String) -> Result<Stri
     let response = s3_request(&config, "GET", &key, &[]).await?;
     let status = response.status().as_u16();
 
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         let body = response.text().await.unwrap_or_default();
         return Err(format!("下载失败，HTTP {} - {}", status, body));
     }
@@ -636,19 +636,17 @@ pub fn run() {
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
-                    match event {
-                        tauri::tray::TrayIconEvent::Click {
-                            button: tauri::tray::MouseButton::Left,
-                            button_state: tauri::tray::MouseButtonState::Up,
-                            ..
-                        } => {
-                            let app = tray.app_handle();
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
                         }
-                        _ => {}
                     }
                 })
                 .build(app)?;
