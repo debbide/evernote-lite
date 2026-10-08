@@ -4,10 +4,8 @@ name: CI
 permissions:
   contents: write
 
+# 只手动触发：Actions → CI → Run workflow，tag 留空只编译，填了就发版
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
       tag:
@@ -73,7 +71,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # 只有手动 Run workflow 并填了 tag 才发版；push 只编译不发版
-          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
+          tagName: ${{ inputs.tag }}
           releaseName: 'evernote-lite ${{ inputs.tag }}'
           releaseBody: 'See the assets to download and install this version.'
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: evernote-lite-windows
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+          retention-days: 90
