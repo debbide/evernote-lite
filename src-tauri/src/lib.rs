@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use tauri::State;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
+use keyring::Entry;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -159,27 +160,67 @@ fn get_launch_file() -> Result<Option<(String, String)>, String> {
     Ok(None)
 }
 
-// --- S3 配置读写 ---
+// --- S3 配置读写（secret_key 存系统钥匙串，s3_config.json 不再落明文） ---
+
+const KEYRING_SERVICE: &str = "evernote-lite";
+const KEYRING_USER: &str = "s3-secret-key";
 
 fn s3_config_path(app_dir: &PathBuf) -> PathBuf {
     app_dir.join("s3_config.json")
 }
 
+/// 读完整 S3 配置（含 secret）。自动把旧版明文 secret_key 迁移进钥匙串。
+fn load_s3_config(app_dir: &PathBuf) -> Result<S3Config, String> {
+    let path = s3_config_path(app_dir);
+    let mut cfg: S3Config = if path.exists() {
+        let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&data).map_err(|e| e.to_string())?
+    } else {
+        S3Config::default()
+    };
+
+    // 迁移：旧版 s3_config.json 里的明文 secret_key → 钥匙串，迁移失败不阻断读取
+    if !cfg.secret_key.is_empty() {
+        if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            if entry.set_password(&cfg.secret_key).is_ok() {
+                cfg.secret_key = String::new();
+                if let Ok(data) = serde_json::to_string_pretty(&cfg) {
+                    let _ = fs::write(&path, data);
+                }
+            }
+        }
+    }
+
+    // 从钥匙串取回 secret
+    if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        if let Ok(pw) = entry.get_password() {
+            cfg.secret_key = pw;
+        }
+    }
+    Ok(cfg)
+}
+
+fn s3_configured(cfg: &S3Config) -> bool {
+    !(cfg.endpoint.is_empty() || cfg.bucket.is_empty() || cfg.access_key.is_empty() || cfg.secret_key.is_empty())
+}
+
 #[tauri::command]
 fn get_s3_config(state: State<AppState>) -> Result<S3Config, String> {
-    let path = s3_config_path(&state.app_dir);
-    if path.exists() {
-        let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&data).map_err(|e| e.to_string())
-    } else {
-        Ok(S3Config::default())
-    }
+    load_s3_config(&state.app_dir)
 }
 
 #[tauri::command]
 fn save_s3_config(state: State<AppState>, config: S3Config) -> Result<(), String> {
+    // secret_key 为空表示用户没改，保留钥匙串里的旧值；写入失败必须报错，不能静默丢密钥
+    if !config.secret_key.is_empty() {
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.to_string())?;
+        entry.set_password(&config.secret_key).map_err(|e| e.to_string())?;
+    }
+    // 落盘不含明文 secret
+    let mut disk_cfg = config;
+    disk_cfg.secret_key = String::new();
     let path = s3_config_path(&state.app_dir);
-    let data = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let data = serde_json::to_string_pretty(&disk_cfg).map_err(|e| e.to_string())?;
     fs::write(&path, data).map_err(|e| e.to_string())
 }
 
@@ -282,20 +323,23 @@ async fn s3_request(config: &S3Config, method: &str, key: &str, body: &[u8]) -> 
 
 #[tauri::command]
 async fn backup_to_s3(state: State<'_, AppState>) -> Result<String, String> {
-    let config = {
-        let path = s3_config_path(&state.app_dir);
-        if !path.exists() {
-            return Err("请先配置 S3 信息".into());
-        }
-        let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str::<S3Config>(&data).map_err(|e| e.to_string())?
-    };
+    let config = load_s3_config(&state.app_dir)?;
+    if !s3_configured(&config) {
+        return Err("请先配置 S3 信息".into());
+    }
 
-    let db_path = state.app_dir.join("notes.db");
-    let db_bytes = {
-        let _guard = state.db.lock().unwrap();
-        fs::read(&db_path).map_err(|e| e.to_string())?
-    };
+    // 用 VACUUM INTO 生成一致性快照：直接 fs::read 正在写入的 db 文件可能读到 torn 的坏库
+    let snapshot_path = state.app_dir.join("notes_backup_snapshot.db");
+    let _ = fs::remove_file(&snapshot_path);
+    {
+        let guard = state.db.lock().unwrap();
+        let conn = guard.as_ref().ok_or("Database not available")?;
+        let escaped = snapshot_path.to_string_lossy().replace('\'', "''");
+        conn.execute(&format!("VACUUM INTO '{}'", escaped), [])
+            .map_err(|e| e.to_string())?;
+    }
+    let db_bytes = fs::read(&snapshot_path).map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(&snapshot_path);
 
     let response = s3_request(&config, "PUT", "notes.db", &db_bytes).await?;
     let status = response.status().as_u16();
@@ -310,14 +354,10 @@ async fn backup_to_s3(state: State<'_, AppState>) -> Result<String, String> {
 
 #[tauri::command]
 async fn restore_from_s3(state: State<'_, AppState>) -> Result<String, String> {
-    let config = {
-        let path = s3_config_path(&state.app_dir);
-        if !path.exists() {
-            return Err("请先配置 S3 信息".into());
-        }
-        let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str::<S3Config>(&data).map_err(|e| e.to_string())?
-    };
+    let config = load_s3_config(&state.app_dir)?;
+    if !s3_configured(&config) {
+        return Err("请先配置 S3 信息".into());
+    }
 
     let response = s3_request(&config, "GET", "notes.db", &[]).await?;
     let status = response.status().as_u16();
@@ -329,15 +369,44 @@ async fn restore_from_s3(state: State<'_, AppState>) -> Result<String, String> {
 
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
     let db_path = state.app_dir.join("notes.db");
+    let tmp_path = state.app_dir.join("notes.db.tmp");
 
+    // 1. 先写临时文件并验证：能打开、notes 表存在。此时旧连接不受任何影响
+    fs::write(&tmp_path, &bytes).map_err(|e| e.to_string())?;
+    let verify: Result<(), String> = (|| {
+        let chk = Connection::open(&tmp_path).map_err(|e| e.to_string())?;
+        chk.query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(e) = verify {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("备份文件校验失败: {}", e));
+    }
+
+    // 2. 关闭旧连接（Windows 下替换文件前必须先释放句柄）
     {
         let mut guard = state.db.lock().unwrap();
         *guard = None;
     }
 
-    fs::write(&db_path, &bytes).map_err(|e| e.to_string())?;
+    // 3. 原子替换；失败则重开旧文件恢复连接，不让应用处于无库状态
+    if let Err(e) = fs::rename(&tmp_path, &db_path) {
+        let _ = fs::remove_file(&tmp_path);
+        let recovered = init_db(&state.app_dir);
+        let mut guard = state.db.lock().unwrap();
+        *guard = recovered.ok();
+        return Err(format!("替换数据库文件失败，已恢复旧库: {}", e));
+    }
 
-    let new_conn = init_db(&state.app_dir).map_err(|e| e.to_string())?;
+    // 4. 重开连接；万一打不开，用刚下载的字节重写一次再试
+    let new_conn = match init_db(&state.app_dir) {
+        Ok(conn) => conn,
+        Err(_) => {
+            let _ = fs::write(&db_path, &bytes);
+            init_db(&state.app_dir).map_err(|e| format!("恢复后数据库无法打开: {}", e))?
+        }
+    };
     {
         let mut guard = state.db.lock().unwrap();
         *guard = Some(new_conn);
