@@ -8,6 +8,7 @@ use tauri::State;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
 use keyring::Entry;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -30,11 +31,18 @@ struct S3Config {
     region: String,
     access_key: String,
     secret_key: String,
+    #[serde(default = "default_retention")]
+    retention: u32,
+}
+
+fn default_retention() -> u32 {
+    30
 }
 
 struct AppState {
     db: Mutex<Option<Connection>>,
     app_dir: PathBuf,
+    op_busy: AtomicBool,
 }
 
 fn init_db(app_dir: &PathBuf) -> Result<Connection> {
@@ -251,7 +259,21 @@ fn build_s3_url(config: &S3Config, key: &str) -> String {
 }
 
 async fn s3_request(config: &S3Config, method: &str, key: &str, body: &[u8]) -> std::result::Result<reqwest::Response, String> {
-    let url_str = build_s3_url(config, key);
+    s3_request_with_query(config, method, key, None, body).await
+}
+
+async fn s3_request_with_query(
+    config: &S3Config,
+    method: &str,
+    key: &str,
+    query: Option<&str>,
+    body: &[u8],
+) -> std::result::Result<reqwest::Response, String> {
+    let base = build_s3_url(config, key);
+    let url_str = match query {
+        Some(q) => format!("{}?{}", base, q),
+        None => base,
+    };
     let url = reqwest::Url::parse(&url_str).map_err(|e| e.to_string())?;
 
     let now = chrono::Utc::now();
@@ -319,14 +341,140 @@ async fn s3_request(config: &S3Config, method: &str, key: &str, body: &[u8]) -> 
     req.send().await.map_err(|e| e.to_string())
 }
 
-// --- S3 备份/恢复 ---
+// --- S3 备份历史（参照 browser-panel：key 带 UTC 时间戳，字典序即时间序） ---
+
+#[derive(Debug, Deserialize)]
+struct S3ListResult {
+    #[serde(rename = "Contents", default)]
+    contents: Vec<S3Object>,
+}
+
+#[derive(Debug, Deserialize)]
+struct S3Object {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+    #[serde(rename = "Size")]
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BackupInfo {
+    key: String,
+    name: String,
+    size: u64,
+    last_modified: String,
+    trigger: String,
+}
+
+/// 并发锁：一次只允许一个备份/恢复在跑（参照 browser-panel 的 busyOp）
+struct OpGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for OpGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_begin_op(state: &AppState) -> Result<OpGuard<'_>, String> {
+    if state.op_busy.swap(true, Ordering::SeqCst) {
+        return Err("已有备份/恢复操作在进行中，请稍候".into());
+    }
+    Ok(OpGuard { flag: &state.op_busy })
+}
+
+fn build_backup_key(trigger: &str) -> String {
+    let t = if trigger == "manual" { "manual" } else { "auto" };
+    let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    format!("backups/{}/notes-{}-{}.db", t, t, stamp)
+}
+
+async fn s3_list_backups(config: &S3Config) -> Result<Vec<S3Object>, String> {
+    let resp = s3_request_with_query(
+        config,
+        "GET",
+        "",
+        Some("list-type=2&max-keys=100&prefix=backups"),
+        &[],
+    )
+    .await?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("列出备份失败，HTTP {} - {}", status, body));
+    }
+    let xml = resp.text().await.map_err(|e| e.to_string())?;
+    let parsed: S3ListResult = quick_xml::de::from_str(&xml).map_err(|e| e.to_string())?;
+    Ok(parsed
+        .contents
+        .into_iter()
+        .filter(|o| o.key.ends_with(".db"))
+        .collect())
+}
+
+fn to_backup_info(o: S3Object) -> BackupInfo {
+    let name = o.key.rsplit('/').next().unwrap_or(&o.key).to_string();
+    let trigger = if o.key.contains("/manual/") {
+        "manual"
+    } else {
+        "auto"
+    }
+    .to_string();
+    BackupInfo {
+        key: o.key,
+        name,
+        size: o.size,
+        last_modified: o.last_modified,
+        trigger,
+    }
+}
 
 #[tauri::command]
-async fn backup_to_s3(state: State<'_, AppState>) -> Result<String, String> {
+async fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupInfo>, String> {
     let config = load_s3_config(&state.app_dir)?;
     if !s3_configured(&config) {
         return Err("请先配置 S3 信息".into());
     }
+    let mut out: Vec<BackupInfo> = s3_list_backups(&config)
+        .await?
+        .into_iter()
+        .map(to_backup_info)
+        .collect();
+    out.sort_by(|a, b| b.key.cmp(&a.key)); // 新的在前（stamp 字典序即时间序）
+    Ok(out)
+}
+
+#[tauri::command]
+async fn delete_backup(state: State<'_, AppState>, key: String) -> Result<(), String> {
+    let config = load_s3_config(&state.app_dir)?;
+    if !s3_configured(&config) {
+        return Err("请先配置 S3 信息".into());
+    }
+    // 安全护栏：只允许删除 backups/ 下的 .db 文件
+    if !key.starts_with("backups/") || !key.ends_with(".db") {
+        return Err("非法的备份 key".into());
+    }
+    let resp = s3_request(&config, "DELETE", &key, &[]).await?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("删除失败，HTTP {}", status));
+    }
+    Ok(())
+}
+
+// --- S3 备份/恢复 ---
+
+#[tauri::command]
+async fn backup_to_s3(state: State<'_, AppState>, trigger: Option<String>) -> Result<String, String> {
+    let _op = try_begin_op(&state)?;
+    let config = load_s3_config(&state.app_dir)?;
+    if !s3_configured(&config) {
+        return Err("请先配置 S3 信息".into());
+    }
+    let trig = trigger.unwrap_or_else(|| "manual".into());
 
     // 用 VACUUM INTO 生成一致性快照：直接 fs::read 正在写入的 db 文件可能读到 torn 的坏库
     let snapshot_path = state.app_dir.join("notes_backup_snapshot.db");
@@ -341,25 +489,45 @@ async fn backup_to_s3(state: State<'_, AppState>) -> Result<String, String> {
     let db_bytes = fs::read(&snapshot_path).map_err(|e| e.to_string())?;
     let _ = fs::remove_file(&snapshot_path);
 
-    let response = s3_request(&config, "PUT", "notes.db", &db_bytes).await?;
+    let key = build_backup_key(&trig);
+    let response = s3_request(&config, "PUT", &key, &db_bytes).await?;
     let status = response.status().as_u16();
 
-    if status >= 200 && status < 300 {
-        Ok("备份成功".into())
-    } else {
+    if status < 200 || status >= 300 {
         let body = response.text().await.unwrap_or_default();
-        Err(format!("备份失败，HTTP {} - {}", status, body))
+        return Err(format!("备份失败，HTTP {} - {}", status, body));
     }
+
+    // 轮转：只保留最近 retention 个，删掉更旧的（轮转失败不影响本次备份结果）
+    let retention = config.retention.clamp(1, 1000) as usize;
+    if let Ok(mut objs) = s3_list_backups(&config).await {
+        objs.sort_by(|a, b| a.key.cmp(&b.key));
+        if objs.len() > retention {
+            for old in objs.iter().take(objs.len() - retention) {
+                let _ = s3_request(&config, "DELETE", &old.key, &[]).await;
+            }
+        }
+    }
+
+    Ok(format!(
+        "备份成功：{}",
+        key.rsplit('/').next().unwrap_or(&key)
+    ))
 }
 
 #[tauri::command]
-async fn restore_from_s3(state: State<'_, AppState>) -> Result<String, String> {
+async fn restore_from_s3(state: State<'_, AppState>, key: String) -> Result<String, String> {
+    let _op = try_begin_op(&state)?;
     let config = load_s3_config(&state.app_dir)?;
     if !s3_configured(&config) {
         return Err("请先配置 S3 信息".into());
     }
+    // 安全护栏：只允许恢复 backups/ 下的 .db 文件
+    if !key.starts_with("backups/") || !key.ends_with(".db") {
+        return Err("非法的备份 key".into());
+    }
 
-    let response = s3_request(&config, "GET", "notes.db", &[]).await?;
+    let response = s3_request(&config, "GET", &key, &[]).await?;
     let status = response.status().as_u16();
 
     if status < 200 || status >= 300 {
@@ -450,6 +618,7 @@ pub fn run() {
             app.manage(AppState {
                 db: Mutex::new(Some(db)),
                 app_dir,
+                op_busy: AtomicBool::new(false),
             });
 
             use tauri::menu::{Menu, MenuItem};
@@ -488,7 +657,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_notes, save_note, delete_note, get_launch_file,
-            get_s3_config, save_s3_config, backup_to_s3, restore_from_s3
+            get_s3_config, save_s3_config, backup_to_s3, restore_from_s3,
+            list_backups, delete_backup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

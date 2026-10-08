@@ -175,7 +175,37 @@ function App() {
   const [showSettings, setShowSettingsState] = useState(false);
   const setShowSettings = (val: boolean) => { showSettingsRef.current = val; setShowSettingsState(val); };
   const [autoStart, setAutoStart] = useState(false);
-  const [s3Config, setS3Config] = useState({ endpoint: '', bucket: '', region: '', access_key: '', secret_key: '' });
+  const [s3Config, setS3Config] = useState({ endpoint: '', bucket: '', region: '', access_key: '', secret_key: '', retention: 30 });
+  interface BackupInfo {
+    key: string;
+    name: string;
+    size: number;
+    last_modified: string;
+    trigger: string;
+  }
+  const [backups, setBackups] = useState<BackupInfo[]>([]);
+  const [backupsLoading, setBackupsLoading] = useState(false);
+  const fetchBackups = async () => {
+    setBackupsLoading(true);
+    try {
+      const list = await invoke<BackupInfo[]>('list_backups', {});
+      setBackups(list);
+    } catch (e: any) {
+      setS3Status('读取备份历史失败: ' + (e.message || String(e)));
+    } finally {
+      setBackupsLoading(false);
+    }
+  };
+  const formatSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  };
+  const formatBackupTime = (iso: string) => {
+    try {
+      return new Date(iso).toLocaleString('zh-CN', { hour12: false });
+    } catch { return iso; }
+  };
   const [s3Status, setS3Status] = useState<string | null>(null);
   const [s3Loading, setS3Loading] = useState(false);
   const [previewModes, setPreviewModes] = useState<Record<number, boolean>>(() => {
@@ -285,7 +315,7 @@ function App() {
         const lastBackup = localStorage.getItem('evernote_lite_last_backup');
         const now = Date.now();
         if (lastBackup && now - parseInt(lastBackup) < 24 * 60 * 60 * 1000) return;
-        await invoke('backup_to_s3', {});
+        await invoke('backup_to_s3', { trigger: 'auto' });
         localStorage.setItem('evernote_lite_last_backup', String(now));
         console.log('Auto backup succeeded');
       } catch (e) {
@@ -756,6 +786,7 @@ function App() {
                 const cfg = await invoke<any>('get_s3_config', {});
                 setS3Config(cfg);
               } catch {}
+              fetchBackups();
             }
             setS3Status(null);
           }} className="flex items-center gap-2 hover:text-white transition-colors text-sm">
@@ -947,6 +978,12 @@ function App() {
                   <input type="password" placeholder="Secret Key" value={s3Config.secret_key} onChange={e => setS3Config({...s3Config, secret_key: e.target.value})}
                     className="w-full bg-[#252526] border border-[#3E3E42] rounded-md py-1.5 px-3 text-sm focus:outline-none focus:border-[#555] placeholder:text-gray-600" />
                 </div>
+                <div className="flex items-center gap-2 mt-3">
+                  <span className="text-xs text-gray-400 whitespace-nowrap">保留最近</span>
+                  <input type="number" min={1} max={1000} value={s3Config.retention} onChange={e => setS3Config({...s3Config, retention: Math.max(1, parseInt(e.target.value) || 30)})}
+                    className="w-20 bg-[#252526] border border-[#3E3E42] rounded-md py-1.5 px-2 text-sm focus:outline-none focus:border-[#555]" />
+                  <span className="text-xs text-gray-400 whitespace-nowrap">个备份（超出的自动删除）</span>
+                </div>
                 <button onClick={async () => {
                   try {
                     await invoke('save_s3_config', { config: s3Config });
@@ -956,31 +993,61 @@ function App() {
                 }} className="mt-3 w-full py-1.5 rounded-md bg-[#2A2A2A] hover:bg-[#3A3A3A] text-sm text-gray-300 transition-colors">
                   保存配置
                 </button>
-                <div className="flex gap-2 mt-3">
-                  <button disabled={s3Loading} onClick={async () => {
-                    setS3Loading(true); setS3Status(null);
-                    try {
-                      const msg = await invoke<string>('backup_to_s3', {});
-                      setS3Status(msg);
-                      localStorage.setItem('evernote_lite_last_backup', String(Date.now()));
-                    } catch (err: any) { setS3Status('备份失败: ' + (err.message || String(err))); }
-                    finally { setS3Loading(false); }
-                  }} className="flex-1 py-1.5 rounded-md bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 text-sm transition-colors disabled:opacity-50">
-                    {s3Loading ? '处理中...' : '备份到 S3'}
-                  </button>
-                  <button disabled={s3Loading} onClick={async () => {
-                    if (!window.confirm('确定要从 S3 恢复吗？本地数据将被覆盖。')) return;
-                    setS3Loading(true); setS3Status(null);
-                    try {
-                      const msg = await invoke<string>('restore_from_s3', {});
-                      setS3Status(msg);
-                      await fetchNotes(searchQuery);
-                      setSelectedNote(null);
-                    } catch (err: any) { setS3Status('恢复失败: ' + (err.message || String(err))); }
-                    finally { setS3Loading(false); }
-                  }} className="flex-1 py-1.5 rounded-md bg-[#2A2A2A] hover:bg-[#3A3A3A] text-gray-300 text-sm transition-colors disabled:opacity-50">
-                    {s3Loading ? '处理中...' : '从 S3 恢复'}
-                  </button>
+                <button disabled={s3Loading} onClick={async () => {
+                  setS3Loading(true); setS3Status(null);
+                  try {
+                    const msg = await invoke<string>('backup_to_s3', { trigger: 'manual' });
+                    setS3Status(msg);
+                    localStorage.setItem('evernote_lite_last_backup', String(Date.now()));
+                    fetchBackups();
+                  } catch (err: any) { setS3Status('备份失败: ' + (err.message || String(err))); }
+                  finally { setS3Loading(false); }
+                }} className="mt-3 w-full py-1.5 rounded-md bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 text-sm transition-colors disabled:opacity-50">
+                  {s3Loading ? '处理中...' : '立即备份'}
+                </button>
+                <div className="mt-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm text-gray-300">备份历史</span>
+                    <button onClick={fetchBackups} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+                      {backupsLoading ? '刷新中...' : '刷新'}
+                    </button>
+                  </div>
+                  {backups.length === 0 && !backupsLoading && (
+                    <div className="text-xs text-gray-600 text-center py-3">暂无备份</div>
+                  )}
+                  <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                    {backups.map(b => (
+                      <div key={b.key} className="flex items-center gap-2 bg-[#252526] rounded-md px-2.5 py-1.5">
+                        <div className="flex-1 min-w-0">
+                          <div className="text-xs text-gray-300 truncate">{formatBackupTime(b.last_modified)}</div>
+                          <div className="text-[10px] text-gray-500 truncate">
+                            {b.trigger === 'manual' ? '手动' : '自动'} · {formatSize(b.size)} · {b.name}
+                          </div>
+                        </div>
+                        <button disabled={s3Loading} onClick={async () => {
+                          if (!window.confirm(`确定要恢复到 ${formatBackupTime(b.last_modified)} 的备份吗？本地数据将被覆盖。`)) return;
+                          setS3Loading(true); setS3Status(null);
+                          try {
+                            const msg = await invoke<string>('restore_from_s3', { key: b.key });
+                            setS3Status(msg);
+                            await fetchNotes(searchQuery);
+                            setSelectedNote(null);
+                          } catch (err: any) { setS3Status('恢复失败: ' + (err.message || String(err))); }
+                          finally { setS3Loading(false); }
+                        }} className="text-xs text-blue-400 hover:text-blue-300 px-1.5 py-0.5 disabled:opacity-50">恢复</button>
+                        <button disabled={s3Loading} onClick={async () => {
+                          if (!window.confirm(`确定删除 ${formatBackupTime(b.last_modified)} 的备份吗？`)) return;
+                          setS3Loading(true); setS3Status(null);
+                          try {
+                            await invoke('delete_backup', { key: b.key });
+                            setS3Status('已删除');
+                            fetchBackups();
+                          } catch (err: any) { setS3Status('删除失败: ' + (err.message || String(err))); }
+                          finally { setS3Loading(false); }
+                        }} className="text-xs text-red-400/80 hover:text-red-300 px-1.5 py-0.5 disabled:opacity-50">删除</button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
                 {s3Status && <div className="mt-2 text-xs text-center text-gray-400">{s3Status}</div>}
               </div>
