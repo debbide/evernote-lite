@@ -7,7 +7,6 @@ use std::sync::Mutex;
 use tauri::State;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
-use keyring::Entry;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -168,44 +167,22 @@ fn get_launch_file() -> Result<Option<(String, String)>, String> {
     Ok(None)
 }
 
-// --- S3 配置读写（secret_key 存系统钥匙串，s3_config.json 不再落明文） ---
-
-const KEYRING_SERVICE: &str = "evernote-lite";
-const KEYRING_USER: &str = "s3-secret-key";
+// --- S3 配置读写 ---
 
 fn s3_config_path(app_dir: &Path) -> PathBuf {
     app_dir.join("s3_config.json")
 }
 
-/// 读完整 S3 配置（含 secret）。自动把旧版明文 secret_key 迁移进钥匙串。
+/// 读完整 S3 配置（含 secret，明文存 s3_config.json，与旧版一致）
 fn load_s3_config(app_dir: &Path) -> Result<S3Config, String> {
     let path = s3_config_path(app_dir);
-    let mut cfg: S3Config = if path.exists() {
+    if path.exists() {
         let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&data).map_err(|e| e.to_string())?
+        let cfg: S3Config = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        Ok(cfg)
     } else {
-        S3Config::default()
-    };
-
-    // 迁移：旧版 s3_config.json 里的明文 secret_key → 钥匙串，迁移失败不阻断读取
-    if !cfg.secret_key.is_empty() {
-        if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if entry.set_password(&cfg.secret_key).is_ok() {
-                cfg.secret_key = String::new();
-                if let Ok(data) = serde_json::to_string_pretty(&cfg) {
-                    let _ = fs::write(&path, data);
-                }
-            }
-        }
+        Ok(S3Config::default())
     }
-
-    // 从钥匙串取回 secret
-    if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        if let Ok(pw) = entry.get_password() {
-            cfg.secret_key = pw;
-        }
-    }
-    Ok(cfg)
 }
 
 fn s3_configured(cfg: &S3Config) -> bool {
@@ -219,16 +196,8 @@ fn get_s3_config(state: State<AppState>) -> Result<S3Config, String> {
 
 #[tauri::command]
 fn save_s3_config(state: State<AppState>, config: S3Config) -> Result<(), String> {
-    // secret_key 为空表示用户没改，保留钥匙串里的旧值；写入失败必须报错，不能静默丢密钥
-    if !config.secret_key.is_empty() {
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.to_string())?;
-        entry.set_password(&config.secret_key).map_err(|e| e.to_string())?;
-    }
-    // 落盘不含明文 secret
-    let mut disk_cfg = config;
-    disk_cfg.secret_key = String::new();
     let path = s3_config_path(&state.app_dir);
-    let data = serde_json::to_string_pretty(&disk_cfg).map_err(|e| e.to_string())?;
+    let data = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     fs::write(&path, data).map_err(|e| e.to_string())
 }
 

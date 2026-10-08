@@ -34,5 +34,4 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
-keyring = "3"
 quick-xml = { version = "0.37", features = ["serialize"] }
