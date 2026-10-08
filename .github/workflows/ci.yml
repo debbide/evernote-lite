@@ -64,3 +64,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # tauri-action 不会自动识别 tag 触发，必须显式传 tagName 才会创建 Release
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: 'evernote-lite ${{ github.ref_name }}'
+          releaseBody: 'See the assets to download and install this version.'
